@@ -85,18 +85,23 @@ use tracinglib as tracing;
 
 #[allow(clippy::type_complexity)]
 struct ResSender<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
-    use_cache_values: HashMap<K, T::Value>,
+    use_cache_values: Option<HashMap<K, T::Value>>,
     tx: oneshot::Sender<Result<HashMap<K, T::Value>, T::Error>>,
+}
+
+enum KeySet<K: Send + Sync + Hash + Eq + Clone + 'static> {
+    One(K),
+    Many(HashSet<K>),
 }
 
 struct Requests<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
     keys: HashSet<K>,
-    pending: Vec<(HashSet<K>, ResSender<K, T>)>,
+    pending: Vec<(KeySet<K>, ResSender<K, T>)>,
     cache_storage: Box<dyn CacheStorage<Key = K, Value = T::Value>>,
     disable_cache: bool,
 }
 
-type KeysAndSender<K, T> = (HashSet<K>, Vec<(HashSet<K>, ResSender<K, T>)>);
+type KeysAndSender<K, T> = (HashSet<K>, Vec<(KeySet<K>, ResSender<K, T>)>);
 
 impl<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> Requests<K, T> {
     fn new<C: CacheFactory>(cache_factory: &C) -> Self {
@@ -166,9 +171,20 @@ impl<T> DataLoaderInner<T> {
                 // send response
                 for (keys, sender) in senders {
                     let mut res = HashMap::new();
-                    res.extend(sender.use_cache_values);
-                    for key in &keys {
-                        res.extend(values.get(key).map(|value| (key.clone(), value.clone())));
+                    if let Some(use_cache_values) = sender.use_cache_values {
+                        res.extend(use_cache_values);
+                    }
+                    match keys {
+                        KeySet::Many(keys) => {
+                            for key in &keys {
+                                res.extend(
+                                    values.get(key).map(|value| (key.clone(), value.clone())),
+                                );
+                            }
+                        }
+                        KeySet::One(key) => {
+                            res.extend(values.get(&key).map(|value| (key.clone(), value.clone())));
+                        }
                     }
                     sender.tx.send(Ok(res)).ok();
                 }
@@ -193,6 +209,13 @@ pub struct DataLoader<T, C = NoCache> {
     max_batch_size: usize,
     disable_cache: AtomicBool,
     spawner: Box<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>,
+}
+
+enum Action<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
+    ImmediateLoad(KeysAndSender<K, T>),
+    StartFetch,
+    RestartFetch(bool),
+    Delay,
 }
 
 impl<T> DataLoader<T, NoCache> {
@@ -304,24 +327,8 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
         K: Send + Sync + Hash + Eq + Clone + 'static,
         T: Loader<K>,
     {
-        let mut values = self.load_many(std::iter::once(key.clone())).await?;
-        Ok(values.remove(&key))
-    }
-
-    /// Use this `DataLoader` to load some data.
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn load_many<K, I>(&self, keys: I) -> Result<HashMap<K, T::Value>, T::Error>
-    where
-        K: Send + Sync + Hash + Eq + Clone + 'static,
-        I: IntoIterator<Item = K>,
-        T: Loader<K>,
-    {
-        enum Action<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
-            ImmediateLoad(KeysAndSender<K, T>),
-            StartFetch,
-            RestartFetch(bool),
-            Delay,
-        }
+        // let mut values = self.load_many(std::iter::once(key.clone())).await?;
+        // Ok(values.remove(&key))
 
         let tid = TypeId::of::<K>();
 
@@ -333,60 +340,139 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
                 .downcast_mut::<Requests<K, T>>()
                 .unwrap();
             let prev_count = typed_requests.keys.len();
-            let mut keys_set = HashSet::new();
-            let mut use_cache_values = HashMap::new();
 
-            if typed_requests.disable_cache || self.disable_cache.load(Ordering::SeqCst) {
-                keys_set = keys.into_iter().collect();
-            } else {
-                for key in keys {
+            let use_cache_values =
+                if typed_requests.disable_cache || self.disable_cache.load(Ordering::SeqCst) {
+                    None
+                } else {
+                    let mut use_cache_values = HashMap::new();
                     if let Some(value) = typed_requests.cache_storage.get(&key) {
-                        // Already in cache
                         use_cache_values.insert(key.clone(), value.clone());
-                    } else {
-                        keys_set.insert(key);
+                        return Ok(Some(value.clone()));
                     }
-                }
-            }
 
-            if !use_cache_values.is_empty() && keys_set.is_empty() {
-                return Ok(use_cache_values);
-            } else if use_cache_values.is_empty() && keys_set.is_empty() {
-                return Ok(Default::default());
-            }
+                    Some(use_cache_values)
+                };
 
-            typed_requests.keys.extend(keys_set.clone());
+            typed_requests.keys.insert(key.clone());
             let (tx, rx) = oneshot::channel();
             typed_requests.pending.push((
-                keys_set,
+                KeySet::One(key.clone()),
                 ResSender {
                     use_cache_values,
                     tx,
                 },
             ));
 
-            if typed_requests.keys.len() >= self.max_batch_size {
-                (Action::ImmediateLoad(typed_requests.take()), rx)
-            } else {
-                (
-                    if self.reset_delay_on_load {
-                        if typed_requests.keys.is_empty() {
-                            Action::Delay
-                        } else {
-                            Action::RestartFetch(prev_count > 0)
-                        }
-                    } else {
-                        if !typed_requests.keys.is_empty() && prev_count == 0 {
-                            Action::StartFetch
-                        } else {
-                            Action::Delay
-                        }
-                    },
-                    rx,
-                )
-            }
+            (self.get_action(typed_requests, prev_count), rx)
         };
 
+        self.execute_action(action, tid);
+
+        let mut values = rx.await.unwrap()?;
+        Ok(values.remove(&key))
+
+        // Ok(None)
+    }
+
+    /// Use this `DataLoader` to load some data.
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    pub async fn load_many<K, I>(&self, keys: I) -> Result<HashMap<K, T::Value>, T::Error>
+    where
+        K: Send + Sync + Hash + Eq + Clone + 'static,
+        I: IntoIterator<Item = K>,
+        T: Loader<K>,
+    {
+        let tid = TypeId::of::<K>();
+
+        let (action, rx) = {
+            let mut requests = self.inner.requests.lock().unwrap();
+            let typed_requests = requests
+                .entry(tid)
+                .or_insert_with(|| Box::new(Requests::<K, T>::new(&self.cache_factory)))
+                .downcast_mut::<Requests<K, T>>()
+                .unwrap();
+            let prev_count = typed_requests.keys.len();
+            let mut keys_set = HashSet::new();
+
+            let use_cache_values =
+                if typed_requests.disable_cache || self.disable_cache.load(Ordering::SeqCst) {
+                    keys_set = keys.into_iter().collect();
+
+                    if keys_set.is_empty() {
+                        return Ok(Default::default());
+                    }
+
+                    None
+                } else {
+                    let mut use_cache_values = HashMap::new();
+                    for key in keys {
+                        if let Some(value) = typed_requests.cache_storage.get(&key) {
+                            // Already in cache
+                            use_cache_values.insert(key.clone(), value.clone());
+                        } else {
+                            keys_set.insert(key);
+                        }
+                    }
+
+                    if keys_set.is_empty() {
+                        return Ok(if use_cache_values.is_empty() {
+                            Default::default()
+                        } else {
+                            use_cache_values
+                        });
+                    }
+
+                    Some(use_cache_values)
+                };
+
+            typed_requests.keys.extend(keys_set.clone());
+            let (tx, rx) = oneshot::channel();
+            typed_requests.pending.push((
+                KeySet::Many(keys_set),
+                ResSender {
+                    use_cache_values,
+                    tx,
+                },
+            ));
+
+            (self.get_action(typed_requests, prev_count), rx)
+        };
+
+        self.execute_action(action, tid);
+
+        rx.await.unwrap()
+    }
+
+    fn get_action<K>(&self, typed_requests: &mut Requests<K, T>, prev_count: usize) -> Action<K, T>
+    where
+        K: Send + Sync + Hash + Eq + Clone + 'static,
+        T: Loader<K>,
+    {
+        if typed_requests.keys.len() >= self.max_batch_size {
+            Action::ImmediateLoad(typed_requests.take())
+        } else {
+            if self.reset_delay_on_load {
+                if typed_requests.keys.is_empty() {
+                    Action::Delay
+                } else {
+                    Action::RestartFetch(prev_count > 0)
+                }
+            } else {
+                if !typed_requests.keys.is_empty() && prev_count == 0 {
+                    Action::StartFetch
+                } else {
+                    Action::Delay
+                }
+            }
+        }
+    }
+
+    fn execute_action<K>(&self, action: Action<K, T>, tid: TypeId)
+    where
+        K: Send + Sync + Hash + Eq + Clone + 'static,
+        T: Loader<K>,
+    {
         match action {
             Action::ImmediateLoad(keys) => {
                 let inner = self.inner.clone();
@@ -468,8 +554,6 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
             }
             Action::Delay => {}
         }
-
-        rx.await.unwrap()
     }
 
     /// Feed some data into the cache.
