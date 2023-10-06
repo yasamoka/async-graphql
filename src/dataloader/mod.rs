@@ -327,9 +327,6 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
         K: Send + Sync + Hash + Eq + Clone + 'static,
         T: Loader<K>,
     {
-        // let mut values = self.load_many(std::iter::once(key.clone())).await?;
-        // Ok(values.remove(&key))
-
         let tid = TypeId::of::<K>();
 
         let (action, rx) = {
@@ -371,8 +368,6 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
 
         let mut values = rx.await.unwrap()?;
         Ok(values.remove(&key))
-
-        // Ok(None)
     }
 
     /// Use this `DataLoader` to load some data.
