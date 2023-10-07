@@ -76,7 +76,7 @@ use fnv::FnvHashMap;
 use futures_channel::oneshot;
 use futures_timer::Delay;
 use futures_util::future::BoxFuture;
-use tokio::select;
+use tokio::{select, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 #[cfg(feature = "tracing")]
 use tracing::{info_span, instrument, Instrument};
@@ -201,14 +201,20 @@ impl<T> DataLoaderInner<T> {
 /// Data loader.
 ///
 /// Reference: <https://github.com/facebook/dataloader>
-pub struct DataLoader<T, C = NoCache> {
+pub struct DataLoader<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C = NoCache> {
     inner: Arc<DataLoaderInner<T>>,
+    tx: mpsc::Sender<LoadKey<K>>,
     cache_factory: C,
     delay: Duration,
     reset_delay_on_load: bool,
     max_batch_size: usize,
     disable_cache: AtomicBool,
     spawner: Box<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>,
+}
+
+enum LoadKey<K: Send + Sync + Hash + Eq + Clone + 'static> {
+    One(K),
+    Many(Vec<K>),
 }
 
 enum Action<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
@@ -218,18 +224,21 @@ enum Action<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
     Delay,
 }
 
-impl<T> DataLoader<T, NoCache> {
+impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static> DataLoader<T, K, NoCache> {
     /// Use `Loader` to create a [DataLoader] that does not cache records.
     pub fn new<S, R>(loader: T, spawner: S) -> Self
     where
         S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
     {
+        let (tx, rx) = mpsc::channel(1000000);
+
         Self {
             inner: Arc::new(DataLoaderInner {
                 requests: Mutex::new(Default::default()),
                 token: Mutex::new(CancellationToken::new()),
                 loader,
             }),
+            tx,
             cache_factory: NoCache,
             delay: Duration::from_millis(1),
             reset_delay_on_load: false,
@@ -242,18 +251,23 @@ impl<T> DataLoader<T, NoCache> {
     }
 }
 
-impl<T, C: CacheFactory> DataLoader<T, C> {
+impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory>
+    DataLoader<T, K, C>
+{
     /// Use `Loader` to create a [DataLoader] with a cache factory.
     pub fn with_cache<S, R>(loader: T, spawner: S, cache_factory: C) -> Self
     where
         S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
     {
+        let (tx, rx) = mpsc::channel(1000000);
+
         Self {
             inner: Arc::new(DataLoaderInner {
                 requests: Mutex::new(Default::default()),
                 token: Mutex::new(CancellationToken::new()),
                 loader,
             }),
+            tx,
             cache_factory,
             delay: Duration::from_millis(1),
             reset_delay_on_load: false,
@@ -305,11 +319,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
     }
 
     /// Enable/Disable cache of specified loader.
-    pub fn enable_cache<K>(&self, enable: bool)
-    where
-        K: Send + Sync + Hash + Eq + Clone + 'static,
-        T: Loader<K>,
-    {
+    pub fn enable_cache(&self, enable: bool) {
         let tid = TypeId::of::<K>();
         let mut requests = self.inner.requests.lock().unwrap();
         let typed_requests = requests
@@ -322,11 +332,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
 
     /// Use this `DataLoader` load a data.
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn load_one<K>(&self, key: K) -> Result<Option<T::Value>, T::Error>
-    where
-        K: Send + Sync + Hash + Eq + Clone + 'static,
-        T: Loader<K>,
-    {
+    pub async fn load_one(&self, key: K) -> Result<Option<T::Value>, T::Error> {
         let tid = TypeId::of::<K>();
 
         let (action, rx) = {
@@ -372,11 +378,9 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
 
     /// Use this `DataLoader` to load some data.
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn load_many<K, I>(&self, keys: I) -> Result<HashMap<K, T::Value>, T::Error>
+    pub async fn load_many<I>(&self, keys: I) -> Result<HashMap<K, T::Value>, T::Error>
     where
-        K: Send + Sync + Hash + Eq + Clone + 'static,
         I: IntoIterator<Item = K>,
-        T: Loader<K>,
     {
         let tid = TypeId::of::<K>();
 
@@ -439,11 +443,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
         rx.await.unwrap()
     }
 
-    fn get_action<K>(&self, typed_requests: &mut Requests<K, T>, prev_count: usize) -> Action<K, T>
-    where
-        K: Send + Sync + Hash + Eq + Clone + 'static,
-        T: Loader<K>,
-    {
+    fn get_action(&self, typed_requests: &mut Requests<K, T>, prev_count: usize) -> Action<K, T> {
         if typed_requests.keys.len() >= self.max_batch_size {
             Action::ImmediateLoad(typed_requests.take())
         } else {
@@ -463,11 +463,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
         }
     }
 
-    fn execute_action<K>(&self, action: Action<K, T>, tid: TypeId)
-    where
-        K: Send + Sync + Hash + Eq + Clone + 'static,
-        T: Loader<K>,
-    {
+    fn execute_action(&self, action: Action<K, T>, tid: TypeId) {
         match action {
             Action::ImmediateLoad(keys) => {
                 let inner = self.inner.clone();
@@ -556,11 +552,9 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
     /// **NOTE: If the cache type is [NoCache], this function will not take
     /// effect. **
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn feed_many<K, I>(&self, values: I)
+    pub async fn feed_many<I>(&self, values: I)
     where
-        K: Send + Sync + Hash + Eq + Clone + 'static,
         I: IntoIterator<Item = (K, T::Value)>,
-        T: Loader<K>,
     {
         let tid = TypeId::of::<K>();
         let mut requests = self.inner.requests.lock().unwrap();
@@ -581,11 +575,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
     /// **NOTE: If the cache type is [NoCache], this function will not take
     /// effect. **
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn feed_one<K>(&self, key: K, value: T::Value)
-    where
-        K: Send + Sync + Hash + Eq + Clone + 'static,
-        T: Loader<K>,
-    {
+    pub async fn feed_one(&self, key: K, value: T::Value) {
         self.feed_many(std::iter::once((key, value))).await;
     }
 
@@ -594,11 +584,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
     /// **NOTE: If the cache type is [NoCache], this function will not take
     /// effect. **
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub fn clear<K>(&self)
-    where
-        K: Send + Sync + Hash + Eq + Clone + 'static,
-        T: Loader<K>,
-    {
+    pub fn clear(&self) {
         let tid = TypeId::of::<K>();
         let mut requests = self.inner.requests.lock().unwrap();
         let typed_requests = requests
@@ -610,11 +596,7 @@ impl<T, C: CacheFactory> DataLoader<T, C> {
     }
 
     /// Gets all values in the cache.
-    pub fn get_cached_values<K>(&self) -> HashMap<K, T::Value>
-    where
-        K: Send + Sync + Hash + Eq + Clone + 'static,
-        T: Loader<K>,
-    {
+    pub fn get_cached_values(&self) -> HashMap<K, T::Value> {
         let tid = TypeId::of::<K>();
         let requests = self.inner.requests.lock().unwrap();
         match requests.get(&tid) {
@@ -679,6 +661,7 @@ mod tests {
             (0..100).map(Option::Some).collect::<Vec<_>>()
         );
 
+        let loader = Arc::new(DataLoader::new(MyLoader, tokio::spawn).max_batch_size(10));
         assert_eq!(
             futures_util::future::try_join_all((0..100i64).map({
                 let loader = loader.clone();
@@ -716,8 +699,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_dataloader_load_empty() {
-        let loader = DataLoader::new(MyLoader, tokio::spawn);
-        assert!(loader.load_many::<i32, _>(vec![]).await.unwrap().is_empty());
+        let loader = DataLoader::<_, i32>::new(MyLoader, tokio::spawn);
+        assert!(loader.load_many(vec![]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -744,7 +727,7 @@ mod tests {
         );
 
         // Clear cache
-        loader.clear::<i32>();
+        loader.clear();
         assert_eq!(
             loader.load_many(vec![1, 2, 3]).await.unwrap(),
             vec![(1, 1), (2, 2), (3, 3)].into_iter().collect()
@@ -779,7 +762,7 @@ mod tests {
         );
 
         // Clear cache
-        loader.clear::<i32>();
+        loader.clear();
         assert_eq!(
             loader.load_many(vec![1, 2, 3]).await.unwrap(),
             vec![(1, 1), (2, 2), (3, 3)].into_iter().collect()
@@ -812,14 +795,14 @@ mod tests {
         loader.feed_many(vec![(1, 10), (2, 20), (3, 30)]).await;
 
         // All from the loader
-        loader.enable_cache::<i32>(false);
+        loader.enable_cache(false);
         assert_eq!(
             loader.load_many(vec![1, 2, 3]).await.unwrap(),
             vec![(1, 1), (2, 2), (3, 3)].into_iter().collect()
         );
 
         // All from the cache
-        loader.enable_cache::<i32>(true);
+        loader.enable_cache(true);
         assert_eq!(
             loader.load_many(vec![1, 2, 3]).await.unwrap(),
             vec![(1, 10), (2, 20), (3, 30)].into_iter().collect()
