@@ -78,27 +78,25 @@ use tracing::{info_span, instrument, Instrument};
 #[cfg(feature = "tracing")]
 use tracinglib as tracing;
 
-#[allow(clippy::type_complexity)]
-struct ResSender<L: Loader> {
-    use_cache_values: Option<HashMap<L::Key, L::Value>>,
-    tx: oneshot::Sender<Result<HashMap<L::Key, L::Value>, L::Error>>,
-}
-
-enum KeySet<K: Send + Sync + Hash + Eq + Clone + 'static> {
-    One(K),
-    Many(HashSet<K>),
+enum Pending<L: Loader> {
+    One {
+        key: L::Key,
+        tx: oneshot::Sender<Result<Option<L::Value>, L::Error>>,
+    },
+    Many {
+        keys: HashSet<L::Key>,
+        use_cache_values: Option<HashMap<L::Key, L::Value>>,
+        tx: oneshot::Sender<Result<HashMap<L::Key, L::Value>, L::Error>>,
+    },
 }
 
 struct Requests<L: Loader> {
     keys: HashSet<L::Key>,
-    pending: Vec<(KeySet<L::Key>, ResSender<L>)>,
+    pending: Vec<Pending<L>>,
     cache_storage: Box<dyn CacheStorage<Key = L::Key, Value = L::Value>>,
 }
 
-type KeysAndSender<L> = (
-    HashSet<<L as Loader>::Key>,
-    Vec<(KeySet<<L as Loader>::Key>, ResSender<L>)>,
-);
+type KeysAndSender<L> = (HashSet<<L as Loader>::Key>, Vec<Pending<L>>);
 
 impl<L: Loader> Requests<L> {
     fn new<C: CacheFactory>(cache_factory: &C) -> Self {
@@ -187,67 +185,66 @@ impl<L: Loader> DataLoaderInner<L> {
                 }
 
                 // send response
-                for (keys, sender) in senders {
-                    let mut res = HashMap::new();
-                    if let Some(use_cache_values) = sender.use_cache_values {
-                        res.extend(use_cache_values);
-                    }
-                    match keys {
-                        KeySet::Many(keys) => {
+                for pending in senders {
+                    match pending {
+                        Pending::One { key, tx } => {
+                            let value = values.get(&key).map(|value| value.clone());
+                            tx.send(Ok(value)).ok();
+                        }
+                        Pending::Many {
+                            keys,
+                            use_cache_values,
+                            tx,
+                        } => {
+                            let mut res = HashMap::new();
+                            if let Some(use_cache_values) = use_cache_values {
+                                res.extend(use_cache_values);
+                            }
+
                             for key in &keys {
                                 res.extend(
                                     values.get(key).map(|value| (key.clone(), value.clone())),
                                 );
                             }
-                        }
-                        KeySet::One(key) => {
-                            res.extend(values.get(&key).map(|value| (key.clone(), value.clone())));
+
+                            tx.send(Ok(res)).ok();
                         }
                     }
-                    sender.tx.send(Ok(res)).ok();
                 }
             }
             Err(err) => {
-                for (_, sender) in senders {
-                    sender.tx.send(Err(err.clone())).ok();
+                for pending in senders {
+                    match pending {
+                        Pending::One { tx, .. } => {
+                            tx.send(Err(err.clone())).ok();
+                        }
+                        Pending::Many { tx, .. } => {
+                            tx.send(Err(err.clone())).ok();
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn load_one(
-        &mut self,
-        key: L::Key,
-        tx: oneshot::Sender<Result<HashMap<L::Key, L::Value>, L::Error>>,
-    ) {
+    fn load_one(&mut self, key: L::Key, tx: oneshot::Sender<Result<Option<L::Value>, L::Error>>) {
         let action = {
             let mut requests = self.requests.lock().unwrap();
             let prev_count = requests.keys.len();
 
-            let use_cache_values = if self.disable_cache {
-                None
-            } else {
-                let mut use_cache_values = HashMap::new();
+            if !self.disable_cache {
                 if let Some(value) = requests.cache_storage.get(&key) {
-                    use_cache_values.insert(key.clone(), value.clone());
-                    // return Ok(Some(value.clone()));
-                    let mut h = HashMap::new();
-                    h.insert(key, value.clone());
-                    tx.send(Ok(h)).ok();
+                    let value = Some(value.clone());
+                    tx.send(Ok(value)).ok();
                     return;
                 }
-
-                Some(use_cache_values)
             };
 
             requests.keys.insert(key.clone());
-            requests.pending.push((
-                KeySet::One(key.clone()),
-                ResSender {
-                    use_cache_values,
-                    tx,
-                },
-            ));
+            requests.pending.push(Pending::One {
+                key: key.clone(),
+                tx,
+            });
 
             self.get_action(&mut requests, prev_count)
         };
@@ -301,13 +298,11 @@ impl<L: Loader> DataLoaderInner<L> {
             };
 
             requests.keys.extend(keys_set.clone());
-            requests.pending.push((
-                KeySet::Many(keys_set),
-                ResSender {
-                    use_cache_values,
-                    tx,
-                },
-            ));
+            requests.pending.push(Pending::Many {
+                keys: keys_set,
+                use_cache_values,
+                tx,
+            });
 
             self.get_action(&mut requests, prev_count)
         };
@@ -475,8 +470,7 @@ impl<L: Loader> DataLoader<L> {
 enum Request<L: Loader> {
     LoadOne {
         key: L::Key,
-        // tx: oneshot::Sender<Result<Option<L::Value>, L::Error>>,
-        tx: oneshot::Sender<Result<HashMap<L::Key, L::Value>, L::Error>>,
+        tx: oneshot::Sender<Result<Option<L::Value>, L::Error>>,
     },
     LoadMany {
         keys: Vec<L::Key>,
@@ -605,8 +599,7 @@ impl<L: Loader> DataLoader<L> {
             })
             .await
             .unwrap();
-        let mut values = rx.await.unwrap()?;
-        Ok(values.remove(&key))
+        rx.await.unwrap()
     }
 
     /// Use this `DataLoader` to load some data.
