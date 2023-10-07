@@ -161,7 +161,11 @@ pub async fn test_find_entity_with_context() {
     type Error = Infallible;
 
     #[async_trait::async_trait]
-    impl Loader<ID, Value, Error> for MyLoader {
+    impl Loader for MyLoader {
+        type Key = ID;
+        type Value = Value;
+        type Error = Error;
+
         async fn load(&self, keys: &[ID]) -> Result<HashMap<ID, Value>, Error> {
             Ok(keys
                 .iter()
@@ -191,7 +195,7 @@ pub async fn test_find_entity_with_context() {
     impl Query {
         #[graphql(entity)]
         async fn find_user_by_id(&self, ctx: &Context<'_>, id: ID) -> FieldResult<MyObj> {
-            let loader = ctx.data_unchecked::<DataLoader<ID, Value, Error>>();
+            let loader = ctx.data_unchecked::<DataLoader<MyLoader>>();
             loader
                 .load_one(id)
                 .await
