@@ -213,8 +213,7 @@ enum Action<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
 }
 
 impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static> DataLoader<T, K, NoCache> {
-    /// Use `Loader` to create a [DataLoader] that does not cache records.
-    pub fn new<S, R>(loader: T, spawner: S) -> Self
+    fn new<S, R>(loader: T, spawner: S) -> Self
     where
         S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
     {
@@ -237,13 +236,68 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static> DataLoader<T, K
             }),
         }
     }
+
+    /// Use 'Loader' to create a builder for a [DataLoader] that does not cache records.
+    pub fn build<S, R>(loader: T, spawner: S) -> DataLoaderBuilder<T, K, NoCache>
+    where
+        S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
+    {
+        DataLoaderBuilder {
+            dataloader: Self::new(loader, spawner),
+        }
+    }
+}
+
+/// Data loader builder
+pub struct DataLoaderBuilder<
+    T: Loader<K>,
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    C: CacheFactory,
+> {
+    dataloader: DataLoader<T, K, C>,
+}
+
+impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory>
+    DataLoaderBuilder<T, K, C>
+{
+    /// Specify the delay time for loading data, the default is `1ms`.
+    #[must_use]
+    pub fn delay(self, delay: Duration) -> Self {
+        let mut dataloader = self.dataloader;
+        dataloader.delay = delay;
+        Self { dataloader }
+    }
+
+    /// Specify whether to reset the delay on load, the default is `false`
+    #[must_use]
+    pub fn reset_delay_on_load(self, reset_delay_on_load: bool) -> Self {
+        let mut dataloader = self.dataloader;
+        dataloader.reset_delay_on_load = reset_delay_on_load;
+        Self { dataloader }
+    }
+
+    /// pub fn Specify the max batch size for loading data, the default is
+    /// `1000`.
+    ///
+    /// If the keys waiting to be loaded reach the threshold, they are loaded
+    /// immediately.
+    #[must_use]
+    pub fn max_batch_size(self, max_batch_size: usize) -> Self {
+        let mut dataloader = self.dataloader;
+        dataloader.max_batch_size = max_batch_size;
+        Self { dataloader }
+    }
+
+    /// Finish building the [DataLoader].
+    pub fn finish(self) -> DataLoader<T, K, C> {
+        self.dataloader
+    }
 }
 
 impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory>
     DataLoader<T, K, C>
 {
-    /// Use `Loader` to create a [DataLoader] with a cache factory.
-    pub fn with_cache<S, R>(loader: T, spawner: S, cache_factory: C) -> Self
+    fn with_cache<S, R>(loader: T, spawner: S, cache_factory: C) -> Self
     where
         S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
     {
@@ -267,31 +321,17 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
         }
     }
 
-    /// Specify the delay time for loading data, the default is `1ms`.
-    #[must_use]
-    pub fn delay(self, delay: Duration) -> Self {
-        Self { delay, ..self }
-    }
-
-    /// Specify whether to reset the delay on load, the default is `false`
-    #[must_use]
-    pub fn reset_delay_on_load(self, reset_delay_on_load: bool) -> Self {
-        Self {
-            reset_delay_on_load,
-            ..self
-        }
-    }
-
-    /// pub fn Specify the max batch size for loading data, the default is
-    /// `1000`.
-    ///
-    /// If the keys waiting to be loaded reach the threshold, they are loaded
-    /// immediately.
-    #[must_use]
-    pub fn max_batch_size(self, max_batch_size: usize) -> Self {
-        Self {
-            max_batch_size,
-            ..self
+    /// Use 'Loader' to create a builder for a [DataLoader] with a cache factory.
+    pub fn build_with_cache<S, R>(
+        loader: T,
+        spawner: S,
+        cache_factory: C,
+    ) -> DataLoaderBuilder<T, K, C>
+    where
+        S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
+    {
+        DataLoaderBuilder {
+            dataloader: Self::with_cache(loader, spawner, cache_factory),
         }
     }
 
@@ -299,17 +339,6 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
     #[inline]
     pub fn loader(&self) -> &T {
         &self.inner.loader
-    }
-
-    /// Enable/Disable cache of all loaders.
-    pub fn enable_all_cache(&self, enable: bool) {
-        self.disable_cache.store(!enable, Ordering::SeqCst);
-    }
-
-    /// Enable/Disable cache of specified loader.
-    pub fn enable_cache(&self, enable: bool) {
-        let mut requests = self.inner.requests.lock().unwrap();
-        requests.disable_cache = !enable;
     }
 
     /// Use this `DataLoader` load a data.
@@ -589,7 +618,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_dataloader() {
-        let loader = Arc::new(DataLoader::new(MyLoader, tokio::spawn).max_batch_size(10));
+        let loader = Arc::new(
+            DataLoader::build(MyLoader, tokio::spawn)
+                .max_batch_size(10)
+                .finish(),
+        );
         assert_eq!(
             futures_util::future::try_join_all((0..100i32).map({
                 let loader = loader.clone();
@@ -603,7 +636,11 @@ mod tests {
             (0..100).map(Option::Some).collect::<Vec<_>>()
         );
 
-        let loader = Arc::new(DataLoader::new(MyLoader, tokio::spawn).max_batch_size(10));
+        let loader = Arc::new(
+            DataLoader::build(MyLoader, tokio::spawn)
+                .max_batch_size(10)
+                .finish(),
+        );
         assert_eq!(
             futures_util::future::try_join_all((0..100i64).map({
                 let loader = loader.clone();
@@ -620,7 +657,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_keys() {
-        let loader = Arc::new(DataLoader::new(MyLoader, tokio::spawn).max_batch_size(10));
+        let loader = Arc::new(
+            DataLoader::build(MyLoader, tokio::spawn)
+                .max_batch_size(10)
+                .finish(),
+        );
         assert_eq!(
             futures_util::future::try_join_all([1, 3, 5, 1, 7, 8, 3, 7].iter().copied().map({
                 let loader = loader.clone();
@@ -712,46 +753,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dataloader_disable_all_cache() {
-        let loader = DataLoader::with_cache(MyLoader, tokio::spawn, HashMapCache::default());
-        loader.feed_many(vec![(1, 10), (2, 20), (3, 30)]).await;
-
-        // All from the loader
-        loader.enable_all_cache(false);
-        assert_eq!(
-            loader.load_many(vec![1, 2, 3]).await.unwrap(),
-            vec![(1, 1), (2, 2), (3, 3)].into_iter().collect()
-        );
-
-        // All from the cache
-        loader.enable_all_cache(true);
-        assert_eq!(
-            loader.load_many(vec![1, 2, 3]).await.unwrap(),
-            vec![(1, 10), (2, 20), (3, 30)].into_iter().collect()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_dataloader_disable_cache() {
-        let loader = DataLoader::with_cache(MyLoader, tokio::spawn, HashMapCache::default());
-        loader.feed_many(vec![(1, 10), (2, 20), (3, 30)]).await;
-
-        // All from the loader
-        loader.enable_cache(false);
-        assert_eq!(
-            loader.load_many(vec![1, 2, 3]).await.unwrap(),
-            vec![(1, 1), (2, 2), (3, 3)].into_iter().collect()
-        );
-
-        // All from the cache
-        loader.enable_cache(true);
-        assert_eq!(
-            loader.load_many(vec![1, 2, 3]).await.unwrap(),
-            vec![(1, 10), (2, 20), (3, 30)].into_iter().collect()
-        );
-    }
-
-    #[tokio::test]
     async fn test_dataloader_dead_lock() {
         struct MyDelayLoader;
 
@@ -767,8 +768,9 @@ mod tests {
         }
 
         let loader = Arc::new(
-            DataLoader::with_cache(MyDelayLoader, tokio::spawn, NoCache)
-                .delay(Duration::from_secs(1)),
+            DataLoader::build_with_cache(MyDelayLoader, tokio::spawn, NoCache)
+                .delay(Duration::from_secs(1))
+                .finish(),
         );
         let handle = tokio::spawn({
             let loader = loader.clone();
