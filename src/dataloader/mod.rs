@@ -62,11 +62,8 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     hash::Hash,
-    ops::DerefMut,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    marker::PhantomData,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -82,9 +79,15 @@ use tracing::{info_span, instrument, Instrument};
 use tracinglib as tracing;
 
 #[allow(clippy::type_complexity)]
-struct ResSender<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
-    use_cache_values: Option<HashMap<K, T::Value>>,
-    tx: oneshot::Sender<Result<HashMap<K, T::Value>, T::Error>>,
+struct ResSender<
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    V: Send + Sync + Clone + 'static,
+    E: Send + Clone + 'static,
+    L: Loader<K, V, E>,
+> {
+    use_cache_values: Option<HashMap<K, V>>,
+    tx: oneshot::Sender<Result<HashMap<K, V>, E>>,
+    l: PhantomData<L>,
 }
 
 enum KeySet<K: Send + Sync + Hash + Eq + Clone + 'static> {
@@ -92,26 +95,35 @@ enum KeySet<K: Send + Sync + Hash + Eq + Clone + 'static> {
     Many(HashSet<K>),
 }
 
-struct Requests<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
+struct Requests<
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    V: Send + Sync + Clone + 'static,
+    E: Send + Clone + 'static,
+    L: Loader<K, V, E>,
+> {
     keys: HashSet<K>,
-    pending: Vec<(KeySet<K>, ResSender<K, T>)>,
-    cache_storage: Box<dyn CacheStorage<Key = K, Value = T::Value>>,
-    disable_cache: bool,
+    pending: Vec<(KeySet<K>, ResSender<K, V, E, L>)>,
+    cache_storage: Box<dyn CacheStorage<Key = K, Value = V>>,
 }
 
-type KeysAndSender<K, T> = (HashSet<K>, Vec<(KeySet<K>, ResSender<K, T>)>);
+type KeysAndSender<K, V, E, L> = (HashSet<K>, Vec<(KeySet<K>, ResSender<K, V, E, L>)>);
 
-impl<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> Requests<K, T> {
+impl<
+        K: Send + Sync + Hash + Eq + Clone + 'static,
+        V: Send + Sync + Clone + 'static,
+        E: Send + Clone + 'static,
+        L: Loader<K, V, E>,
+    > Requests<K, V, E, L>
+{
     fn new<C: CacheFactory>(cache_factory: &C) -> Self {
         Self {
             keys: Default::default(),
             pending: Vec::new(),
-            cache_storage: cache_factory.create::<K, T::Value>(),
-            disable_cache: false,
+            cache_storage: cache_factory.create::<K, V>(),
         }
     }
 
-    fn take(&mut self) -> KeysAndSender<K, T> {
+    fn take(&mut self) -> KeysAndSender<K, V, E, L> {
         (
             std::mem::take(&mut self.keys),
             std::mem::take(&mut self.pending),
@@ -121,34 +133,72 @@ impl<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> Requests<K, T> 
 
 /// Trait for batch loading.
 #[async_trait::async_trait]
-pub trait Loader<K: Send + Sync + Hash + Eq + Clone + 'static>: Send + Sync + 'static {
-    /// type of value.
-    type Value: Send + Sync + Clone + 'static;
-
-    /// Type of error.
-    type Error: Send + Clone + 'static;
-
+pub trait Loader<
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    V: Send + Sync + Clone + 'static,
+    E: Send + Clone + 'static,
+>: Send + Sync + Clone + 'static
+{
     /// Load the data set specified by the `keys`.
-    async fn load(&self, keys: &[K]) -> Result<HashMap<K, Self::Value>, Self::Error>;
+    async fn load(&self, keys: &[K]) -> Result<HashMap<K, V>, E>;
 }
 
-struct DataLoaderInner<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
-    requests: Mutex<Requests<K, T>>,
-    token: Mutex<CancellationToken>,
-    loader: T,
+struct DataLoaderInner<
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    V: Send + Sync + Clone + 'static,
+    E: Send + Clone + 'static,
+    L: Loader<K, V, E>,
+> {
+    requests: Arc<Mutex<Requests<K, V, E, L>>>,
+    token: CancellationToken,
+    loader: L,
+    delay: Duration,
+    reset_delay_on_load: bool,
+    max_batch_size: usize,
+    disable_cache: bool,
+    spawner: Box<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>,
 }
 
-impl<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> DataLoaderInner<K, T> {
+impl<
+        K: Send + Sync + Hash + Eq + Clone + 'static,
+        V: Send + Sync + Clone + 'static,
+        E: Send + Clone + 'static,
+        L: Loader<K, V, E>,
+    > DataLoaderInner<K, V, E, L>
+{
+    fn new<S, R, C>(loader: L, spawner: S, cache_factory: &C) -> Self
+    where
+        S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
+        C: CacheFactory,
+    {
+        Self {
+            requests: Arc::new(Mutex::new(Requests::<K, V, E, L>::new(cache_factory))),
+            token: CancellationToken::new(),
+            loader,
+            delay: Duration::from_millis(1),
+            reset_delay_on_load: false,
+            max_batch_size: 1000,
+            disable_cache: false,
+            spawner: Box::new(move |fut| {
+                spawner(fut);
+            }),
+        }
+    }
+
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    async fn do_load(&self, disable_cache: bool, (keys, senders): KeysAndSender<K, T>) {
+    async fn do_load(
+        loader: L,
+        requests: Arc<Mutex<Requests<K, V, E, L>>>,
+        disable_cache: bool,
+        (keys, senders): KeysAndSender<K, V, E, L>,
+    ) {
         let keys = keys.into_iter().collect::<Vec<_>>();
 
-        match self.loader.load(&keys).await {
+        match loader.load(&keys).await {
             Ok(values) => {
                 // update cache
-                let mut requests = self.requests.lock().unwrap();
-                let disable_cache = requests.disable_cache || disable_cache;
                 if !disable_cache {
+                    let mut requests = requests.lock().unwrap();
                     for (key, value) in &values {
                         requests
                             .cache_storage
@@ -184,183 +234,23 @@ impl<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> DataLoaderInner
             }
         }
     }
-}
 
-/// Data loader.
-///
-/// Reference: <https://github.com/facebook/dataloader>
-pub struct DataLoader<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C = NoCache> {
-    inner: Arc<DataLoaderInner<K, T>>,
-    tx: mpsc::Sender<LoadKey<K>>,
-    cache_factory: C,
-    delay: Duration,
-    reset_delay_on_load: bool,
-    max_batch_size: usize,
-    disable_cache: AtomicBool,
-    spawner: Box<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>,
-}
-
-enum LoadKey<K: Send + Sync + Hash + Eq + Clone + 'static> {
-    One(K),
-    Many(Vec<K>),
-}
-
-enum Action<K: Send + Sync + Hash + Eq + Clone + 'static, T: Loader<K>> {
-    ImmediateLoad(KeysAndSender<K, T>),
-    StartFetch,
-    RestartFetch(bool),
-    Delay,
-}
-
-impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static> DataLoader<T, K, NoCache> {
-    fn new<S, R>(loader: T, spawner: S) -> Self
-    where
-        S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
-    {
-        let (tx, rx) = mpsc::channel(1000000);
-
-        Self {
-            inner: Arc::new(DataLoaderInner {
-                requests: Mutex::new(Requests::<K, T>::new(&NoCache)),
-                token: Mutex::new(CancellationToken::new()),
-                loader,
-            }),
-            tx,
-            cache_factory: NoCache,
-            delay: Duration::from_millis(1),
-            reset_delay_on_load: false,
-            max_batch_size: 1000,
-            disable_cache: false.into(),
-            spawner: Box::new(move |fut| {
-                spawner(fut);
-            }),
-        }
-    }
-
-    /// Use 'Loader' to create a builder for a [DataLoader] that does not cache records.
-    pub fn build<S, R>(loader: T, spawner: S) -> DataLoaderBuilder<T, K, NoCache>
-    where
-        S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
-    {
-        DataLoaderBuilder {
-            dataloader: Self::new(loader, spawner),
-        }
-    }
-}
-
-/// Data loader builder
-pub struct DataLoaderBuilder<
-    T: Loader<K>,
-    K: Send + Sync + Hash + Eq + Clone + 'static,
-    C: CacheFactory,
-> {
-    dataloader: DataLoader<T, K, C>,
-}
-
-impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory>
-    DataLoaderBuilder<T, K, C>
-{
-    /// Specify the delay time for loading data, the default is `1ms`.
-    #[must_use]
-    pub fn delay(self, delay: Duration) -> Self {
-        let mut dataloader = self.dataloader;
-        dataloader.delay = delay;
-        Self { dataloader }
-    }
-
-    /// Specify whether to reset the delay on load, the default is `false`
-    #[must_use]
-    pub fn reset_delay_on_load(self, reset_delay_on_load: bool) -> Self {
-        let mut dataloader = self.dataloader;
-        dataloader.reset_delay_on_load = reset_delay_on_load;
-        Self { dataloader }
-    }
-
-    /// pub fn Specify the max batch size for loading data, the default is
-    /// `1000`.
-    ///
-    /// If the keys waiting to be loaded reach the threshold, they are loaded
-    /// immediately.
-    #[must_use]
-    pub fn max_batch_size(self, max_batch_size: usize) -> Self {
-        let mut dataloader = self.dataloader;
-        dataloader.max_batch_size = max_batch_size;
-        Self { dataloader }
-    }
-
-    /// Finish building the [DataLoader].
-    pub fn finish(self) -> DataLoader<T, K, C> {
-        self.dataloader
-    }
-}
-
-impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory>
-    DataLoader<T, K, C>
-{
-    fn with_cache<S, R>(loader: T, spawner: S, cache_factory: C) -> Self
-    where
-        S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
-    {
-        let (tx, rx) = mpsc::channel(1000000);
-
-        Self {
-            inner: Arc::new(DataLoaderInner {
-                requests: Mutex::new(Requests::<K, T>::new(&cache_factory)),
-                token: Mutex::new(CancellationToken::new()),
-                loader,
-            }),
-            tx,
-            cache_factory,
-            delay: Duration::from_millis(1),
-            reset_delay_on_load: false,
-            max_batch_size: 1000,
-            disable_cache: false.into(),
-            spawner: Box::new(move |fut| {
-                spawner(fut);
-            }),
-        }
-    }
-
-    /// Use 'Loader' to create a builder for a [DataLoader] with a cache factory.
-    pub fn build_with_cache<S, R>(
-        loader: T,
-        spawner: S,
-        cache_factory: C,
-    ) -> DataLoaderBuilder<T, K, C>
-    where
-        S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
-    {
-        DataLoaderBuilder {
-            dataloader: Self::with_cache(loader, spawner, cache_factory),
-        }
-    }
-
-    /// Get the loader.
-    #[inline]
-    pub fn loader(&self) -> &T {
-        &self.inner.loader
-    }
-
-    /// Use this `DataLoader` load a data.
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn load_one(&self, key: K) -> Result<Option<T::Value>, T::Error> {
+    async fn load_one(&mut self, key: K) -> Result<Option<V>, E> {
         let (action, rx) = {
-            let mut guard = self.inner.requests.lock().unwrap();
-            let requests = &mut *guard;
+            let mut requests = self.requests.lock().unwrap();
             let prev_count = requests.keys.len();
 
-            let use_cache_values =
-                if requests.disable_cache || self.disable_cache.load(Ordering::SeqCst) {
-                    None
-                } else {
-                    let mut use_cache_values = HashMap::new();
-                    if let Some(value) = requests.cache_storage.get(&key) {
-                        use_cache_values.insert(key.clone(), value.clone());
-                        return Ok(Some(value.clone()));
-                    }
+            let use_cache_values = if self.disable_cache {
+                None
+            } else {
+                let mut use_cache_values = HashMap::new();
+                if let Some(value) = requests.cache_storage.get(&key) {
+                    use_cache_values.insert(key.clone(), value.clone());
+                    return Ok(Some(value.clone()));
+                }
 
-                    Some(use_cache_values)
-                };
+                Some(use_cache_values)
+            };
 
             requests.keys.insert(key.clone());
             let (tx, rx) = oneshot::channel();
@@ -369,10 +259,11 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
                 ResSender {
                     use_cache_values,
                     tx,
+                    l: PhantomData,
                 },
             ));
 
-            (self.get_action(requests, prev_count), rx)
+            (self.get_action(&mut requests, prev_count), rx)
         };
 
         self.execute_action(action);
@@ -381,48 +272,44 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
         Ok(values.remove(&key))
     }
 
-    /// Use this `DataLoader` to load some data.
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn load_many<I>(&self, keys: I) -> Result<HashMap<K, T::Value>, T::Error>
+    async fn load_many<I>(&mut self, keys: I) -> Result<HashMap<K, V>, E>
     where
         I: IntoIterator<Item = K>,
     {
         let (action, rx) = {
-            let mut guard = self.inner.requests.lock().unwrap();
-            let requests = &mut *guard;
+            let mut requests = self.requests.lock().unwrap();
             let prev_count = requests.keys.len();
             let mut keys_set = HashSet::new();
 
-            let use_cache_values =
-                if requests.disable_cache || self.disable_cache.load(Ordering::SeqCst) {
-                    keys_set = keys.into_iter().collect();
+            let use_cache_values = if self.disable_cache {
+                keys_set = keys.into_iter().collect();
 
-                    if keys_set.is_empty() {
-                        return Ok(Default::default());
+                if keys_set.is_empty() {
+                    return Ok(Default::default());
+                }
+
+                None
+            } else {
+                let mut use_cache_values = HashMap::new();
+                for key in keys {
+                    if let Some(value) = requests.cache_storage.get(&key) {
+                        // Already in cache
+                        use_cache_values.insert(key.clone(), value.clone());
+                    } else {
+                        keys_set.insert(key);
                     }
+                }
 
-                    None
-                } else {
-                    let mut use_cache_values = HashMap::new();
-                    for key in keys {
-                        if let Some(value) = requests.cache_storage.get(&key) {
-                            // Already in cache
-                            use_cache_values.insert(key.clone(), value.clone());
-                        } else {
-                            keys_set.insert(key);
-                        }
-                    }
+                if keys_set.is_empty() {
+                    return Ok(if use_cache_values.is_empty() {
+                        Default::default()
+                    } else {
+                        use_cache_values
+                    });
+                }
 
-                    if keys_set.is_empty() {
-                        return Ok(if use_cache_values.is_empty() {
-                            Default::default()
-                        } else {
-                            use_cache_values
-                        });
-                    }
-
-                    Some(use_cache_values)
-                };
+                Some(use_cache_values)
+            };
 
             requests.keys.extend(keys_set.clone());
             let (tx, rx) = oneshot::channel();
@@ -431,10 +318,11 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
                 ResSender {
                     use_cache_values,
                     tx,
+                    l: PhantomData,
                 },
             ));
 
-            (self.get_action(requests, prev_count), rx)
+            (self.get_action(&mut requests, prev_count), rx)
         };
 
         self.execute_action(action);
@@ -442,9 +330,13 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
         rx.await.unwrap()
     }
 
-    fn get_action(&self, requests: &mut Requests<K, T>, prev_count: usize) -> Action<K, T> {
+    fn get_action(
+        &self,
+        requests: &mut Requests<K, V, E, L>,
+        prev_count: usize,
+    ) -> Action<K, V, E, L> {
         if requests.keys.len() >= self.max_batch_size {
-            Action::ImmediateLoad(requests.take())
+            Action::ImmediateLoad(requests.take(), PhantomData)
         } else {
             if self.reset_delay_on_load {
                 if requests.keys.is_empty() {
@@ -462,12 +354,14 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
         }
     }
 
-    fn execute_action(&self, action: Action<K, T>) {
+    fn execute_action(&mut self, action: Action<K, V, E, L>) {
         match action {
-            Action::ImmediateLoad(keys) => {
-                let inner = self.inner.clone();
-                let disable_cache = self.disable_cache.load(Ordering::SeqCst);
-                let task = async move { inner.do_load(disable_cache, keys).await };
+            Action::ImmediateLoad(keys, PhantomData) => {
+                let loader = self.loader.clone();
+                let requests = self.requests.clone();
+                let disable_cache = self.disable_cache;
+                let task =
+                    async move { Self::do_load(loader, requests, disable_cache, keys).await };
                 #[cfg(feature = "tracing")]
                 let task = task
                     .instrument(info_span!("immediate_load"))
@@ -476,20 +370,21 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
                 (self.spawner)(Box::pin(task));
             }
             Action::StartFetch => {
-                let inner = self.inner.clone();
-                let disable_cache = self.disable_cache.load(Ordering::SeqCst);
+                let loader = self.loader.clone();
+                let requests = self.requests.clone();
+                let disable_cache = self.disable_cache;
                 let delay = self.delay;
 
                 let task = async move {
                     Delay::new(delay).await;
 
                     let keys = {
-                        let mut requests = inner.requests.lock().unwrap();
+                        let mut requests = requests.lock().unwrap();
                         requests.take()
                     };
 
                     if !keys.0.is_empty() {
-                        inner.do_load(disable_cache, keys).await
+                        Self::do_load(loader, requests, disable_cache, keys).await
                     }
                 };
                 #[cfg(feature = "tracing")]
@@ -497,18 +392,17 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
                 (self.spawner)(Box::pin(task))
             }
             Action::RestartFetch(restart) => {
-                let inner = self.inner.clone();
-                let disable_cache = self.disable_cache.load(Ordering::SeqCst);
+                let loader = self.loader.clone();
+                let requests = self.requests.clone();
+                let disable_cache = self.disable_cache;
                 let delay = self.delay;
 
                 let child_token = {
-                    let mut guard = self.inner.token.lock().unwrap();
-                    let token = guard.deref_mut();
                     if restart {
-                        token.cancel();
-                        *token = CancellationToken::new();
+                        self.token.cancel();
+                        self.token = CancellationToken::new();
                     }
-                    token.child_token()
+                    self.token.child_token()
                 };
 
                 let task = async move {
@@ -516,12 +410,12 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
                         _ = child_token.cancelled() => {}
                         _ = Delay::new(delay) => {
                             let keys = {
-                                let mut requests = inner.requests.lock().unwrap();
+                                let mut requests = requests.lock().unwrap();
                                 requests.take()
                             };
 
                             if !keys.0.is_empty() {
-                                inner.do_load(disable_cache, keys).await
+                                Self::do_load(loader, requests, disable_cache, keys).await
                             }
                         }
                     }
@@ -536,22 +430,268 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
         }
     }
 
-    /// Feed some data into the cache.
-    ///
-    /// **NOTE: If the cache type is [NoCache], this function will not take
-    /// effect. **
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn feed_many<I>(&self, values: I)
+    async fn feed_many<I>(&self, items: I)
     where
-        I: IntoIterator<Item = (K, T::Value)>,
+        I: IntoIterator<Item = (K, V)>,
     {
-        let mut guard = self.inner.requests.lock().unwrap();
-        let requests = &mut *guard;
-        for (key, value) in values {
+        let mut requests = self.requests.lock().unwrap();
+
+        for (key, value) in items {
             requests
                 .cache_storage
                 .insert(Cow::Owned(key), Cow::Owned(value));
         }
+    }
+
+    async fn feed_one(&self, key: K, value: V) {
+        self.feed_many(std::iter::once((key, value))).await;
+    }
+
+    fn clear(&self) {
+        let mut requests = self.requests.lock().unwrap();
+        requests.cache_storage.clear();
+    }
+
+    fn get_cached_values(&mut self) -> HashMap<K, V> {
+        let requests = self.requests.lock().unwrap();
+        requests
+            .cache_storage
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
+
+/// Data loader.
+///
+/// Reference: <https://github.com/facebook/dataloader>
+pub struct DataLoader<
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    V: Send + Sync + Clone + 'static,
+    E: Send + Clone + 'static,
+> {
+    tx: mpsc::Sender<Request<K, V, E>>,
+    v: PhantomData<V>,
+    e: PhantomData<E>,
+}
+
+enum Action<
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    V: Send + Sync + Clone + 'static,
+    E: Send + Clone + 'static,
+    L: Loader<K, V, E>,
+> {
+    ImmediateLoad(KeysAndSender<K, V, E, L>, PhantomData<L>),
+    StartFetch,
+    RestartFetch(bool),
+    Delay,
+}
+
+impl<
+        K: Send + Sync + Hash + Eq + Clone + 'static,
+        V: Send + Sync + Clone + 'static,
+        E: Send + Clone + 'static,
+    > DataLoader<K, V, E>
+{
+    /// Use 'Loader' to create a builder for a [DataLoader] that does not cache records.
+    pub fn build<L, S, R>(loader: L, spawner: S) -> DataLoaderBuilder<K, V, E, L>
+    where
+        L: Loader<K, V, E>,
+        S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
+    {
+        let (tx, rx) = mpsc::channel(1000000);
+        DataLoaderBuilder {
+            dataloader: Self {
+                tx,
+                v: PhantomData,
+                e: PhantomData,
+            },
+            inner: DataLoaderInner::new(loader, spawner, &NoCache),
+            rx,
+        }
+    }
+}
+
+enum Request<
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    V: Send + Sync + Clone + 'static,
+    E: Send + Clone + 'static,
+> {
+    LoadOne {
+        key: K,
+        tx: oneshot::Sender<Result<Option<V>, E>>,
+    },
+    LoadMany {
+        keys: Vec<K>,
+        tx: oneshot::Sender<Result<HashMap<K, V>, E>>,
+    },
+    FeedOne {
+        key: K,
+        value: V,
+        tx: oneshot::Sender<()>,
+    },
+    FeedMany {
+        items: Vec<(K, V)>,
+        tx: oneshot::Sender<()>,
+    },
+    Clear {
+        tx: oneshot::Sender<()>,
+    },
+    GetCachedValues {
+        tx: oneshot::Sender<HashMap<K, V>>,
+    },
+}
+
+async fn dataloader_task<
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    V: Send + Sync + Clone + 'static,
+    E: Send + Clone + 'static,
+    L: Loader<K, V, E>,
+>(
+    mut inner: DataLoaderInner<K, V, E, L>,
+    mut rx: mpsc::Receiver<Request<K, V, E>>,
+) {
+    while let Some(request) = rx.recv().await {
+        match request {
+            Request::LoadOne { key, tx } => {
+                let v = inner.load_one(key).await;
+                tx.send(v).ok();
+            }
+            Request::LoadMany { keys, tx } => {
+                let v = inner.load_many(keys).await;
+                tx.send(v).ok();
+            }
+            Request::FeedOne { key, value, tx } => {
+                let v = inner.feed_one(key, value).await;
+                tx.send(v).ok();
+            }
+            Request::FeedMany { items, tx } => {
+                let v = inner.feed_many(items).await;
+                tx.send(v).ok();
+            }
+            Request::Clear { tx } => {
+                inner.clear();
+                tx.send(()).ok();
+            }
+            Request::GetCachedValues { tx } => {
+                let v = inner.get_cached_values();
+                tx.send(v).ok();
+            }
+        }
+    }
+}
+
+/// Data loader builder
+pub struct DataLoaderBuilder<
+    K: Send + Sync + Hash + Eq + Clone + 'static,
+    V: Send + Sync + Clone + 'static,
+    E: Send + Clone + 'static,
+    L: Loader<K, V, E>,
+> {
+    dataloader: DataLoader<K, V, E>,
+    inner: DataLoaderInner<K, V, E, L>,
+    rx: mpsc::Receiver<Request<K, V, E>>,
+}
+
+impl<
+        K: Send + Sync + Hash + Eq + Clone + 'static,
+        V: Send + Sync + Clone + 'static,
+        E: Send + Clone + 'static,
+        L: Loader<K, V, E>,
+    > DataLoaderBuilder<K, V, E, L>
+{
+    /// Specify the delay time for loading data, the default is `1ms`.
+    #[must_use]
+    pub fn delay(self, delay: Duration) -> Self {
+        let mut inner = self.inner;
+        inner.delay = delay;
+        Self { inner, ..self }
+    }
+
+    /// Specify whether to reset the delay on load, the default is `false`
+    #[must_use]
+    pub fn reset_delay_on_load(self, reset_delay_on_load: bool) -> Self {
+        let mut inner = self.inner;
+        inner.reset_delay_on_load = reset_delay_on_load;
+        Self { inner, ..self }
+    }
+
+    /// pub fn Specify the max batch size for loading data, the default is
+    /// `1000`.
+    ///
+    /// If the keys waiting to be loaded reach the threshold, they are loaded
+    /// immediately.
+    #[must_use]
+    pub fn max_batch_size(self, max_batch_size: usize) -> Self {
+        let mut inner = self.inner;
+        inner.max_batch_size = max_batch_size;
+        Self { inner, ..self }
+    }
+
+    /// Finish building the [DataLoader].
+    pub fn finish(self) -> DataLoader<K, V, E> {
+        tokio::spawn(dataloader_task(self.inner, self.rx));
+        self.dataloader
+    }
+}
+
+impl<
+        K: Send + Sync + Hash + Eq + Clone + 'static,
+        V: Send + Sync + Clone + 'static,
+        E: Send + Clone + 'static,
+    > DataLoader<K, V, E>
+{
+    /// Use 'Loader' to create a builder for a [DataLoader] with a cache factory.
+    pub fn build_with_cache<L, S, R, C>(
+        loader: L,
+        spawner: S,
+        cache_factory: C,
+    ) -> DataLoaderBuilder<K, V, E, L>
+    where
+        L: Loader<K, V, E>,
+        S: Fn(BoxFuture<'static, ()>) -> R + Send + Sync + 'static,
+        C: CacheFactory,
+    {
+        let (tx, rx) = mpsc::channel(1000000);
+        DataLoaderBuilder {
+            dataloader: Self {
+                tx,
+                v: PhantomData,
+                e: PhantomData,
+            },
+            inner: DataLoaderInner::new(loader, spawner, &cache_factory),
+            rx,
+        }
+    }
+
+    /// Use this `DataLoader` load a data.
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    pub async fn load_one(&self, key: K) -> Result<Option<V>, E> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .clone()
+            .send(Request::LoadOne { key, tx })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    /// Use this `DataLoader` to load some data.
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    pub async fn load_many<I>(&self, keys: I) -> Result<HashMap<K, V>, E>
+    where
+        I: IntoIterator<Item = K>,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .clone()
+            .send(Request::LoadMany {
+                keys: keys.into_iter().collect(),
+                tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap()
     }
 
     /// Feed some data into the cache.
@@ -559,8 +699,35 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
     /// **NOTE: If the cache type is [NoCache], this function will not take
     /// effect. **
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub async fn feed_one(&self, key: K, value: T::Value) {
-        self.feed_many(std::iter::once((key, value))).await;
+    pub async fn feed_one(&self, key: K, value: V) {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .clone()
+            .send(Request::FeedOne { key, value, tx })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    /// Feed some data into the cache.
+    ///
+    /// **NOTE: If the cache type is [NoCache], this function will not take
+    /// effect. **
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    pub async fn feed_many<I>(&self, items: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .clone()
+            .send(Request::FeedMany {
+                items: items.into_iter().collect(),
+                tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap()
     }
 
     /// Clears the cache.
@@ -568,19 +735,21 @@ impl<T: Loader<K>, K: Send + Sync + Hash + Eq + Clone + 'static, C: CacheFactory
     /// **NOTE: If the cache type is [NoCache], this function will not take
     /// effect. **
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub fn clear(&self) {
-        let mut requests = self.inner.requests.lock().unwrap();
-        requests.cache_storage.clear();
+    pub async fn clear(&self) {
+        let (tx, rx) = oneshot::channel();
+        self.tx.clone().send(Request::Clear { tx }).await.unwrap();
+        rx.await.unwrap()
     }
 
     /// Gets all values in the cache.
-    pub fn get_cached_values(&self) -> HashMap<K, T::Value> {
-        let requests = self.inner.requests.lock().unwrap();
-        requests
-            .cache_storage
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+    pub async fn get_cached_values(&self) -> HashMap<K, V> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .clone()
+            .send(Request::GetCachedValues { tx })
+            .await
+            .unwrap();
+        rx.await.unwrap()
     }
 }
 
@@ -592,25 +761,20 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone)]
     struct MyLoader;
 
     #[async_trait::async_trait]
-    impl Loader<i32> for MyLoader {
-        type Value = i32;
-        type Error = ();
-
-        async fn load(&self, keys: &[i32]) -> Result<HashMap<i32, Self::Value>, Self::Error> {
+    impl Loader<i32, i32, ()> for MyLoader {
+        async fn load(&self, keys: &[i32]) -> Result<HashMap<i32, i32>, ()> {
             assert!(keys.len() <= 10);
             Ok(keys.iter().copied().map(|k| (k, k)).collect())
         }
     }
 
     #[async_trait::async_trait]
-    impl Loader<i64> for MyLoader {
-        type Value = i64;
-        type Error = ();
-
-        async fn load(&self, keys: &[i64]) -> Result<HashMap<i64, Self::Value>, Self::Error> {
+    impl Loader<i64, i64, ()> for MyLoader {
+        async fn load(&self, keys: &[i64]) -> Result<HashMap<i64, i64>, ()> {
             assert!(keys.len() <= 10);
             Ok(keys.iter().copied().map(|k| (k, k)).collect())
         }
@@ -682,13 +846,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_dataloader_load_empty() {
-        let loader = DataLoader::<_, i32>::new(MyLoader, tokio::spawn);
+        let loader = DataLoader::<_, i32, ()>::build(MyLoader, tokio::spawn).finish();
         assert!(loader.load_many(vec![]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn test_dataloader_with_cache() {
-        let loader = DataLoader::with_cache(MyLoader, tokio::spawn, HashMapCache::default());
+        let loader =
+            DataLoader::build_with_cache(MyLoader, tokio::spawn, HashMapCache::default()).finish();
         loader.feed_many(vec![(1, 10), (2, 20), (3, 30)]).await;
 
         // All from the cache
@@ -710,7 +875,7 @@ mod tests {
         );
 
         // Clear cache
-        loader.clear();
+        loader.clear().await;
         assert_eq!(
             loader.load_many(vec![1, 2, 3]).await.unwrap(),
             vec![(1, 1), (2, 2), (3, 3)].into_iter().collect()
@@ -719,11 +884,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_dataloader_with_cache_hashmap_fnv() {
-        let loader = DataLoader::with_cache(
+        let loader = DataLoader::build_with_cache(
             MyLoader,
             tokio::spawn,
             HashMapCache::<FnvBuildHasher>::new(),
-        );
+        )
+        .finish();
         loader.feed_many(vec![(1, 10), (2, 20), (3, 30)]).await;
 
         // All from the cache
@@ -745,7 +911,7 @@ mod tests {
         );
 
         // Clear cache
-        loader.clear();
+        loader.clear().await;
         assert_eq!(
             loader.load_many(vec![1, 2, 3]).await.unwrap(),
             vec![(1, 1), (2, 2), (3, 3)].into_iter().collect()
@@ -754,14 +920,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_dataloader_dead_lock() {
+        #[derive(Clone)]
         struct MyDelayLoader;
 
         #[async_trait::async_trait]
-        impl Loader<i32> for MyDelayLoader {
-            type Value = i32;
-            type Error = ();
-
-            async fn load(&self, keys: &[i32]) -> Result<HashMap<i32, Self::Value>, Self::Error> {
+        impl Loader<i32, i32, ()> for MyDelayLoader {
+            async fn load(&self, keys: &[i32]) -> Result<HashMap<i32, i32>, ()> {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 Ok(keys.iter().copied().map(|k| (k, k)).collect())
             }

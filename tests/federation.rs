@@ -154,14 +154,15 @@ pub async fn test_federation() {
 
 #[tokio::test]
 pub async fn test_find_entity_with_context() {
+    #[derive(Clone)]
     struct MyLoader;
 
-    #[async_trait::async_trait]
-    impl Loader<ID> for MyLoader {
-        type Value = MyObj;
-        type Error = Infallible;
+    type Value = MyObj;
+    type Error = Infallible;
 
-        async fn load(&self, keys: &[ID]) -> Result<HashMap<ID, Self::Value>, Self::Error> {
+    #[async_trait::async_trait]
+    impl Loader<ID, Value, Error> for MyLoader {
+        async fn load(&self, keys: &[ID]) -> Result<HashMap<ID, Value>, Error> {
             Ok(keys
                 .iter()
                 .filter(|id| id.as_str() != "999")
@@ -190,7 +191,7 @@ pub async fn test_find_entity_with_context() {
     impl Query {
         #[graphql(entity)]
         async fn find_user_by_id(&self, ctx: &Context<'_>, id: ID) -> FieldResult<MyObj> {
-            let loader = ctx.data_unchecked::<DataLoader<MyLoader, _>>();
+            let loader = ctx.data_unchecked::<DataLoader<ID, Value, Error>>();
             loader
                 .load_one(id)
                 .await
