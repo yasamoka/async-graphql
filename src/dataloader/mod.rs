@@ -215,8 +215,12 @@ impl<L: Loader> DataLoaderInner<L> {
         }
     }
 
-    async fn load_one(&mut self, key: L::Key) -> Result<Option<L::Value>, L::Error> {
-        let (action, rx) = {
+    fn load_one(
+        &mut self,
+        key: L::Key,
+        tx: oneshot::Sender<Result<HashMap<L::Key, L::Value>, L::Error>>,
+    ) {
+        let action = {
             let mut requests = self.requests.lock().unwrap();
             let prev_count = requests.keys.len();
 
@@ -226,14 +230,17 @@ impl<L: Loader> DataLoaderInner<L> {
                 let mut use_cache_values = HashMap::new();
                 if let Some(value) = requests.cache_storage.get(&key) {
                     use_cache_values.insert(key.clone(), value.clone());
-                    return Ok(Some(value.clone()));
+                    // return Ok(Some(value.clone()));
+                    let mut h = HashMap::new();
+                    h.insert(key, value.clone());
+                    tx.send(Ok(h)).ok();
+                    return;
                 }
 
                 Some(use_cache_values)
             };
 
             requests.keys.insert(key.clone());
-            let (tx, rx) = oneshot::channel();
             requests.pending.push((
                 KeySet::One(key.clone()),
                 ResSender {
@@ -242,20 +249,20 @@ impl<L: Loader> DataLoaderInner<L> {
                 },
             ));
 
-            (self.get_action(&mut requests, prev_count), rx)
+            self.get_action(&mut requests, prev_count)
         };
 
         self.execute_action(action);
-
-        let mut values = rx.await.unwrap()?;
-        Ok(values.remove(&key))
     }
 
-    async fn load_many<I>(&mut self, keys: I) -> Result<HashMap<L::Key, L::Value>, L::Error>
-    where
+    fn load_many<I>(
+        &mut self,
+        keys: I,
+        tx: oneshot::Sender<Result<HashMap<L::Key, L::Value>, L::Error>>,
+    ) where
         I: IntoIterator<Item = L::Key>,
     {
-        let (action, rx) = {
+        let action = {
             let mut requests = self.requests.lock().unwrap();
             let prev_count = requests.keys.len();
             let mut keys_set = HashSet::new();
@@ -264,7 +271,8 @@ impl<L: Loader> DataLoaderInner<L> {
                 keys_set = keys.into_iter().collect();
 
                 if keys_set.is_empty() {
-                    return Ok(Default::default());
+                    tx.send(Ok(Default::default())).ok();
+                    return;
                 }
 
                 None
@@ -280,18 +288,19 @@ impl<L: Loader> DataLoaderInner<L> {
                 }
 
                 if keys_set.is_empty() {
-                    return Ok(if use_cache_values.is_empty() {
+                    tx.send(Ok(if use_cache_values.is_empty() {
                         Default::default()
                     } else {
                         use_cache_values
-                    });
+                    }))
+                    .ok();
+                    return;
                 }
 
                 Some(use_cache_values)
             };
 
             requests.keys.extend(keys_set.clone());
-            let (tx, rx) = oneshot::channel();
             requests.pending.push((
                 KeySet::Many(keys_set),
                 ResSender {
@@ -300,12 +309,10 @@ impl<L: Loader> DataLoaderInner<L> {
                 },
             ));
 
-            (self.get_action(&mut requests, prev_count), rx)
+            self.get_action(&mut requests, prev_count)
         };
 
         self.execute_action(action);
-
-        rx.await.unwrap()
     }
 
     fn get_action(&self, requests: &mut Requests<L>, prev_count: usize) -> Action<L> {
@@ -404,7 +411,7 @@ impl<L: Loader> DataLoaderInner<L> {
         }
     }
 
-    async fn feed_many<I>(&self, items: I)
+    fn feed_many<I>(&self, items: I)
     where
         I: IntoIterator<Item = (L::Key, L::Value)>,
     {
@@ -417,8 +424,8 @@ impl<L: Loader> DataLoaderInner<L> {
         }
     }
 
-    async fn feed_one(&self, key: L::Key, value: L::Value) {
-        self.feed_many(std::iter::once((key, value))).await;
+    fn feed_one(&self, key: L::Key, value: L::Value) {
+        self.feed_many(std::iter::once((key, value)));
     }
 
     fn clear(&self) {
@@ -468,7 +475,8 @@ impl<L: Loader> DataLoader<L> {
 enum Request<L: Loader> {
     LoadOne {
         key: L::Key,
-        tx: oneshot::Sender<Result<Option<L::Value>, L::Error>>,
+        // tx: oneshot::Sender<Result<Option<L::Value>, L::Error>>,
+        tx: oneshot::Sender<Result<HashMap<L::Key, L::Value>, L::Error>>,
     },
     LoadMany {
         keys: Vec<L::Key>,
@@ -498,19 +506,17 @@ async fn dataloader_task<L: Loader>(
     while let Some(request) = rx.recv().await {
         match request {
             Request::LoadOne { key, tx } => {
-                let v = inner.load_one(key).await;
-                tx.send(v).ok();
+                inner.load_one(key, tx);
             }
             Request::LoadMany { keys, tx } => {
-                let v = inner.load_many(keys).await;
-                tx.send(v).ok();
+                inner.load_many(keys, tx);
             }
             Request::FeedOne { key, value, tx } => {
-                let v = inner.feed_one(key, value).await;
+                let v = inner.feed_one(key, value);
                 tx.send(v).ok();
             }
             Request::FeedMany { items, tx } => {
-                let v = inner.feed_many(items).await;
+                let v = inner.feed_many(items);
                 tx.send(v).ok();
             }
             Request::Clear { tx } => {
@@ -593,10 +599,14 @@ impl<L: Loader> DataLoader<L> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .clone()
-            .send(Request::LoadOne { key, tx })
+            .send(Request::LoadOne {
+                key: key.clone(),
+                tx,
+            })
             .await
             .unwrap();
-        rx.await.unwrap()
+        let mut values = rx.await.unwrap()?;
+        Ok(values.remove(&key))
     }
 
     /// Use this `DataLoader` to load some data.
